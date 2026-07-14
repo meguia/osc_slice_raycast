@@ -114,11 +114,20 @@ def slice_plane_basis(normal: Vector) -> tuple[Vector, Vector]:
 
 
 def object_by_index(index: int) -> bpy.types.Object:
-    collection = bpy.data.collections.get(COLLECTION_NAME)
-    objects = list(collection.objects) if collection else []
+    objects = slice_objects()
     if index < 0 or index >= len(objects):
         raise IndexError(f"object index {index} is out of range")
     return objects[index]
+
+
+def slice_objects() -> list[bpy.types.Object]:
+    collection = bpy.data.collections.get(COLLECTION_NAME)
+    if collection is None:
+        return []
+    return sorted(
+        (obj for obj in collection.objects if obj.type == "MESH"),
+        key=lambda obj: obj.name.lower(),
+    )
 
 
 def mesh_for_object(obj: bpy.types.Object) -> bpy.types.Mesh:

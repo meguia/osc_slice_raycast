@@ -1,0 +1,16 @@
+action	object_index	visible	duration_seconds	frame_interval_seconds	frequency_hz	radial_sample_count	base_normal_x	base_normal_y	base_normal_z	axis_x	axis_y	axis_z	distance
+show	1	1											
+start_slice	1		4.0	0.05	0.25	128	0.0	0.0	1.0	0.2	0.2	1.0	0.0
+show	5	1											
+start_slice	5		5.0	0.05	0.2	128	0.0	0.0	1.0	0.2	0.2	1.0	0.0
+show	13	1											
+start_slice	13		4.0	0.05	0.5	128	0.0	0.0	1.0	0.2	0.2	1.0	0.25
+show	1	0											
+wait			1.0										
+show	5	0											
+wait			1.0										
+show	5	1											
+start_slice	5		1.0	0.05	1.0	128	0.0	0.0	1.0	0.0	1.0	0.0	0.0
+show	1	0											
+show	5	0											
+show	13	0											

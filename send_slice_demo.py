@@ -31,6 +31,8 @@ DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 9001
 DEFAULT_INTERVAL_SECONDS = 0.1
 DEFAULT_LINGER_SECONDS = 1.0
+DEFAULT_STARTUP_DELAY_SECONDS = 0.5
+DEFAULT_WARMUP_DELAY_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,33 @@ def main() -> int:
             f"Defaults to {DEFAULT_LINGER_SECONDS}."
         ),
     )
+    parser.add_argument(
+        "--startup-delay",
+        type=float,
+        default=DEFAULT_STARTUP_DELAY_SECONDS,
+        help=f"Seconds to wait before sending the first message. Defaults to {DEFAULT_STARTUP_DELAY_SECONDS}.",
+    )
+    parser.add_argument(
+        "--warmup-first",
+        action="store_true",
+        help="Send the first message, wait, then continue with the remaining messages.",
+    )
+    parser.add_argument(
+        "--warmup-delay",
+        type=float,
+        default=DEFAULT_WARMUP_DELAY_SECONDS,
+        help=f"Seconds to wait after the first warmup message. Defaults to {DEFAULT_WARMUP_DELAY_SECONDS}.",
+    )
+    parser.add_argument(
+        "--no-listen",
+        action="store_true",
+        help="Only send /slice/set messages; do not listen for /slice/radii replies.",
+    )
+    parser.add_argument(
+        "--print-radii",
+        action="store_true",
+        help="Print full returned radius arrays instead of only reply counts.",
+    )
     args = parser.parse_args()
 
     messages = load_slice_messages(args.tsv)
@@ -106,28 +135,40 @@ def main() -> int:
         print(f"No slice messages found in {args.tsv}", file=sys.stderr)
         return 1
 
-    server = OSCThreadServer()
-    server.listen(address=args.listen_host, port=args.listen_port, default=True)
-    server.bind(b"/slice/radii", print_slice_radii)
-    server.bind(b"/osc/error", print_osc_error)
+    server = None
+    if not args.no_listen:
+        server = OSCThreadServer()
+        server.listen(address=args.listen_host, port=args.listen_port, default=True)
+        server.bind(b"/slice/radii", make_print_slice_radii(args.print_radii))
+        server.bind(b"/osc/error", print_osc_error)
 
     client = OSCClient(args.host, args.port)
-    print(
-        f"Listening on {args.listen_host}:{args.listen_port} for "
-        "/slice/radii and /osc/error"
-    )
+    if server is None:
+        print("Reply listener disabled")
+    else:
+        print(
+            f"Listening on {args.listen_host}:{args.listen_port} for "
+            "/slice/radii and /osc/error"
+        )
     print(
         f"Sending {len(messages)} /slice/set messages to "
         f"{args.host}:{args.port} every {args.interval:g}s"
     )
 
     try:
+        if args.startup_delay > 0.0:
+            print(f"Waiting {args.startup_delay:g}s before sending...")
+            time.sleep(args.startup_delay)
+
         for index, message in enumerate(messages, start=1):
             payload = message.osc_payload()
             client.send_message(b"/slice/set", payload)
             print_sent_message(index, len(messages), message)
 
-            if index < len(messages):
+            if args.warmup_first and index == 1 and len(messages) > 1:
+                print(f"Warmup sent; waiting {args.warmup_delay:g}s before continuing...")
+                time.sleep(args.warmup_delay)
+            elif index < len(messages):
                 time.sleep(args.interval)
 
         if args.linger > 0.0:
@@ -135,7 +176,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
-        server.stop_all()
+        if server is not None:
+            server.stop_all()
 
     return 0
 
@@ -152,19 +194,27 @@ def print_sent_message(index: int, total: int, message: SliceMessage) -> None:
     )
 
 
-def print_slice_radii(*args: Any) -> None:
-    if len(args) < 2:
-        print(f"Unexpected /slice/radii payload: {args}", file=sys.stderr)
-        return
+def make_print_slice_radii(print_full_radii: bool):
+    def print_slice_radii(*args: Any) -> None:
+        if len(args) < 2:
+            print(f"Unexpected /slice/radii payload: {args}", file=sys.stderr)
+            return
 
-    object_index = _as_int(args[0])
-    radii = [_as_float(value) for value in args[1:]]
-    formatted_radii = "\t".join(f"{radius:.6f}" for radius in radii)
-    print(
-        f"received /slice/radii object={object_index} count={len(radii)}\t"
-        f"{formatted_radii}",
-        flush=True,
-    )
+        object_index = _as_int(args[0])
+        radii_count = len(args) - 1
+        if not print_full_radii:
+            print(f"received /slice/radii object={object_index} count={radii_count}", flush=True)
+            return
+
+        radii = [_as_float(value) for value in args[1:]]
+        formatted_radii = "\t".join(f"{radius:.6f}" for radius in radii)
+        print(
+            f"received /slice/radii object={object_index} count={len(radii)}\t"
+            f"{formatted_radii}",
+            flush=True,
+        )
+
+    return print_slice_radii
 
 
 def print_osc_error(*args: Any) -> None:

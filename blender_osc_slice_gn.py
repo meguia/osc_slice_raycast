@@ -248,6 +248,7 @@ def _sample_points(
     distance: float,
     sample_count: int,
 ) -> tuple[list[float], list[tuple[float, float, float] | None]]:
+    # The BVH uses mesh vertex coordinates, so normal and distance are object-local.
     basis_u, basis_v = _slice_plane_basis(normal)
     center = normal * distance
     radii: list[float] = []
@@ -375,16 +376,24 @@ def _carrier_object_name(source_name: str) -> str:
 def _object_by_index(index: int) -> bpy.types.Object:
     obj = _object_by_index_or_none(index)
     if obj is None:
-        collection = bpy.data.collections.get(COLLECTION_NAME)
-        count = len(collection.objects) if collection else 0
+        count = len(_slice_objects())
         raise IndexError(f"object index {index} is out of range ({count} objects)")
     return obj
 
 
 def _object_by_index_or_none(index: int) -> bpy.types.Object | None:
-    collection = bpy.data.collections.get(COLLECTION_NAME)
-    objects = list(collection.objects) if collection else []
+    objects = _slice_objects()
     return objects[index] if 0 <= index < len(objects) else None
+
+
+def _slice_objects() -> list[bpy.types.Object]:
+    collection = bpy.data.collections.get(COLLECTION_NAME)
+    if collection is None:
+        return []
+    return sorted(
+        (obj for obj in collection.objects if obj.type == "MESH"),
+        key=lambda obj: obj.name.lower(),
+    )
 
 
 def _mesh_for_object(obj: bpy.types.Object) -> bpy.types.Mesh:
