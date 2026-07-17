@@ -82,9 +82,9 @@ PLANE_OBJECT_PREFIX = "SlicePlaneDynamic"
 LOOP_OBJECT_PREFIX = "SliceLoopDynamic"
 
 OSC_RECEIVE_HOST = "0.0.0.0"
-OSC_RECEIVE_PORT = 9000
+OSC_RECEIVE_PORT = 9005
 OSC_SEND_HOST = "127.0.0.1"
-OSC_SEND_PORT = 9001
+OSC_SEND_PORT = 9006
 
 SLICE_SEND_ADDRESS = b"/slice/radii"
 ERROR_SEND_ADDRESS = b"/osc/error"
@@ -232,10 +232,6 @@ def _set_slice(*args: object) -> None:
     sample_count = _as_int(args[2])
     if sample_count <= 0:
         raise ValueError("sample count must be greater than zero")
-
-    if object_index not in _active_slots:
-        print(f"Ignoring /slice/set id={message_id} for inactive object index {object_index}")
-        return
 
     source = _source_object_by_index(object_index)
     proxy = _proxy_object_by_index(object_index)

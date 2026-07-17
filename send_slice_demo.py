@@ -1,295 +1,345 @@
-"""
-Send demo /slice/set OSC messages to blender_osc_slice.py.
+"""Minimal end-to-end OSC test for the slicer and visualizer.
 
-The input is a tab-separated file with these columns:
+The interaction mirrors the useful part of ``concert-paleolithics.scd``:
+one channel/slot requests a loop for one object while the same cutting plane is
+shown in Blender.  This script deliberately does not reproduce the concert.
 
-    object_index radial_sample_count normal_x normal_y normal_z distance
+For every plane in a short rotation it sends:
 
-Each row is sent as:
+    slicer:     /slice/get message_id object_id samples nx ny nz distance
+    visualizer: /slice/set slot_id object_id nx ny nz distance
 
-    /slice/set object_index radial_sample_count normal_x normal_y normal_z distance
+It listens for and validates:
+
+    /slice/radii message_id object_id radius_0 ... radius_N_minus_1
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
+import math
+import queue
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from oscpy.client import OSCClient
 from oscpy.server import OSCThreadServer
 
 
-DEFAULT_TSV = Path(__file__).with_name("slice_demo.tsv")
-DEFAULT_BLENDER_HOST = "127.0.0.1"
-DEFAULT_BLENDER_PORT = 9000
-DEFAULT_LISTEN_HOST = "0.0.0.0"
-DEFAULT_LISTEN_PORT = 9001
-DEFAULT_INTERVAL_SECONDS = 0.1
-DEFAULT_LINGER_SECONDS = 1.0
-DEFAULT_STARTUP_DELAY_SECONDS = 0.5
-DEFAULT_WARMUP_DELAY_SECONDS = 2.0
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_SLICER_PORT = 9000
+DEFAULT_REPLY_HOST = "0.0.0.0"
+DEFAULT_REPLY_PORT = 9001
+DEFAULT_VISUALIZER_PORT = 9005
 
 
 @dataclass(frozen=True)
-class SliceMessage:
-    object_index: int
-    radial_sample_count: int
-    normal: tuple[float, float, float]
-    distance: float
-
-    def osc_payload(self) -> list[float | int]:
-        return [
-            self.object_index,
-            self.radial_sample_count,
-            self.normal[0],
-            self.normal[1],
-            self.normal[2],
-            self.distance,
-        ]
+class SliceReply:
+    message_id: int
+    object_id: int
+    radii: tuple[float, ...]
 
 
-def main() -> int:
+class ReplyInbox:
+    """Thread-safe handoff from the OSC callback to the demo loop."""
+
+    def __init__(self) -> None:
+        self._items: "queue.Queue[SliceReply | ValueError]" = queue.Queue()
+
+    def receive(self, *args: Any) -> None:
+        try:
+            if len(args) < 2:
+                raise ValueError(
+                    f"/slice/radii needs message_id and object_id; received {args!r}"
+                )
+            self._items.put(
+                SliceReply(
+                    message_id=_as_int(args[0]),
+                    object_id=_as_int(args[1]),
+                    radii=tuple(_as_float(value) for value in args[2:]),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            self._items.put(ValueError(f"invalid /slice/radii reply: {exc}"))
+
+    def wait_for(self, message_id: int, timeout: float) -> SliceReply:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError(
+                    f"no /slice/radii reply for message {message_id} within {timeout:g}s"
+                )
+            try:
+                item = self._items.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError(
+                    f"no /slice/radii reply for message {message_id} within {timeout:g}s"
+                ) from exc
+
+            if isinstance(item, ValueError):
+                raise item
+            if item.message_id == message_id:
+                return item
+
+            print(
+                f"Ignoring unrelated /slice/radii message id={item.message_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Send tab-separated /slice/set messages to Blender."
-    )
-    parser.add_argument(
-        "tsv",
-        nargs="?",
-        type=Path,
-        default=DEFAULT_TSV,
-        help=f"TSV path. Defaults to {DEFAULT_TSV.name}.",
+        description=(
+            "Test the headless slice server and proxy visualizer with one rotating "
+            "cutting plane."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--host",
-        default=DEFAULT_BLENDER_HOST,
-        help=f"Blender OSC host. Defaults to {DEFAULT_BLENDER_HOST}.",
+        default=DEFAULT_HOST,
+        help="Host of both Blender processes",
     )
     parser.add_argument(
-        "--port",
+        "--slicer-port",
         type=int,
-        default=DEFAULT_BLENDER_PORT,
-        help=f"Blender OSC port. Defaults to {DEFAULT_BLENDER_PORT}.",
+        default=DEFAULT_SLICER_PORT,
+        help="Port receiving /slice/get",
+    )
+    parser.add_argument(
+        "--visualizer-port",
+        type=int,
+        default=DEFAULT_VISUALIZER_PORT,
+        help="Port receiving visualizer messages",
+    )
+    parser.add_argument(
+        "--reply-host",
+        default=DEFAULT_REPLY_HOST,
+        help="Local interface on which to receive /slice/radii",
+    )
+    parser.add_argument(
+        "--reply-port",
+        type=int,
+        default=DEFAULT_REPLY_PORT,
+        help="Local port on which to receive /slice/radii",
+    )
+    parser.add_argument(
+        "--object-id",
+        type=int,
+        default=0,
+        help="Object slice_index",
+    )
+    parser.add_argument(
+        "--slot-id",
+        type=int,
+        default=0,
+        help="Visualizer slot/channel",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=1024,
+        help="Radii requested from the sonification server",
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=16,
+        help="Number of cutting planes in one full rotation",
     )
     parser.add_argument(
         "--interval",
         type=float,
-        default=DEFAULT_INTERVAL_SECONDS,
-        help=f"Seconds between messages. Defaults to {DEFAULT_INTERVAL_SECONDS}.",
+        default=0.1,
+        help="Minimum seconds between requests",
     )
     parser.add_argument(
-        "--listen-host",
-        default=DEFAULT_LISTEN_HOST,
-        help=f"Host for replies from Blender. Defaults to {DEFAULT_LISTEN_HOST}.",
-    )
-    parser.add_argument(
-        "--listen-port",
-        type=int,
-        default=DEFAULT_LISTEN_PORT,
-        help=f"Port for replies from Blender. Defaults to {DEFAULT_LISTEN_PORT}.",
-    )
-    parser.add_argument(
-        "--linger",
+        "--reply-timeout",
         type=float,
-        default=DEFAULT_LINGER_SECONDS,
-        help=(
-            "Seconds to keep listening after the last message. "
-            f"Defaults to {DEFAULT_LINGER_SECONDS}."
-        ),
+        default=2.0,
+        help="Seconds to wait for each server reply",
     )
     parser.add_argument(
-        "--startup-delay",
+        "--distance",
         type=float,
-        default=DEFAULT_STARTUP_DELAY_SECONDS,
-        help=f"Seconds to wait before sending the first message. Defaults to {DEFAULT_STARTUP_DELAY_SECONDS}.",
-    )
-    parser.add_argument(
-        "--warmup-first",
-        action="store_true",
-        help="Send the first message, wait, then continue with the remaining messages.",
-    )
-    parser.add_argument(
-        "--warmup-delay",
-        type=float,
-        default=DEFAULT_WARMUP_DELAY_SECONDS,
-        help=f"Seconds to wait after the first warmup message. Defaults to {DEFAULT_WARMUP_DELAY_SECONDS}.",
-    )
-    parser.add_argument(
-        "--no-listen",
-        action="store_true",
-        help="Only send /slice/set messages; do not listen for /slice/radii replies.",
+        default=0.0,
+        help="Signed cutting-plane distance from the object origin",
     )
     parser.add_argument(
         "--print-radii",
         action="store_true",
-        help="Print full returned radius arrays instead of only reply counts.",
+        help="Print every returned radius instead of summary statistics",
+    )
+    parser.add_argument(
+        "--hide-at-end",
+        action="store_true",
+        help="Hide the visualizer slot after a successful test",
     )
     args = parser.parse_args()
 
-    messages = load_slice_messages(args.tsv)
-    if not messages:
-        print(f"No slice messages found in {args.tsv}", file=sys.stderr)
+    if args.samples <= 0:
+        parser.error("--samples must be greater than zero")
+    if args.frames <= 0:
+        parser.error("--frames must be greater than zero")
+    if args.interval < 0.0:
+        parser.error("--interval cannot be negative")
+    if args.reply_timeout <= 0.0:
+        parser.error("--reply-timeout must be greater than zero")
+    if not 0 <= args.slot_id < 20:
+        parser.error("--slot-id must be between 0 and 19")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    inbox = ReplyInbox()
+    listener = OSCThreadServer()
+
+    try:
+        listener.listen(
+            address=args.reply_host,
+            port=args.reply_port,
+            default=True,
+        )
+        listener.bind(b"/slice/radii", inbox.receive)
+    except OSError as exc:
+        print(
+            f"Cannot listen for replies on {args.reply_host}:{args.reply_port}: {exc}",
+            file=sys.stderr,
+        )
         return 1
 
-    server = None
-    if not args.no_listen:
-        server = OSCThreadServer()
-        server.listen(address=args.listen_host, port=args.listen_port, default=True)
-        server.bind(b"/slice/radii", make_print_slice_radii(args.print_radii))
-        server.bind(b"/osc/error", print_osc_error)
+    slicer = OSCClient(args.host, args.slicer_port)
+    visualizer = OSCClient(args.host, args.visualizer_port)
+    latencies: list[float] = []
 
-    client = OSCClient(args.host, args.port)
-    if server is None:
-        print("Reply listener disabled")
-    else:
-        print(
-            f"Listening on {args.listen_host}:{args.listen_port} for "
-            "/slice/radii and /osc/error"
-        )
     print(
-        f"Sending {len(messages)} /slice/set messages to "
-        f"{args.host}:{args.port} every {args.interval:g}s"
+        f"Listening for /slice/radii on {args.reply_host}:{args.reply_port}\n"
+        f"Testing object {args.object_id} in visual slot {args.slot_id}: "
+        f"{args.frames} frames, {args.samples} radii per frame"
     )
 
     try:
-        if args.startup_delay > 0.0:
-            print(f"Waiting {args.startup_delay:g}s before sending...")
-            time.sleep(args.startup_delay)
+        visualizer.send_message(b"/preload", [args.object_id])
+        next_frame_at = time.monotonic()
 
-        for index, message in enumerate(messages, start=1):
-            payload = message.osc_payload()
-            client.send_message(b"/slice/set", payload)
-            print_sent_message(index, len(messages), message)
+        for frame_index in range(args.frames):
+            _wait_until(next_frame_at)
+            normal = _rotation_normal(frame_index, args.frames)
+            message_id = frame_index + 1
 
-            if args.warmup_first and index == 1 and len(messages) > 1:
-                print(f"Warmup sent; waiting {args.warmup_delay:g}s before continuing...")
-                time.sleep(args.warmup_delay)
-            elif index < len(messages):
-                time.sleep(args.interval)
+            visualizer.send_message(
+                b"/slice/set",
+                [args.slot_id, args.object_id, *normal, args.distance],
+            )
+            if frame_index == 0:
+                visualizer.send_message(b"/slice/show", [args.slot_id, 1])
 
-        if args.linger > 0.0:
-            time.sleep(args.linger)
+            started = time.monotonic()
+            slicer.send_message(
+                b"/slice/get",
+                [message_id, args.object_id, args.samples, *normal, args.distance],
+            )
+            reply = inbox.wait_for(message_id, args.reply_timeout)
+            latency = time.monotonic() - started
+            _validate_reply(reply, args.object_id, args.samples)
+            latencies.append(latency)
+            _print_reply(
+                frame_index,
+                args.frames,
+                reply,
+                normal,
+                latency,
+                args.print_radii,
+            )
+            next_frame_at = max(next_frame_at + args.interval, time.monotonic())
+
+        if args.hide_at_end:
+            visualizer.send_message(b"/slice/show", [args.slot_id, 0])
     except KeyboardInterrupt:
-        print("\nStopping.")
+        print("\nTest interrupted.", file=sys.stderr)
+        return 130
+    except (OSError, TimeoutError, ValueError) as exc:
+        print(f"TEST FAILED: {exc}", file=sys.stderr)
+        return 1
     finally:
-        if server is not None:
-            server.stop_all()
+        listener.stop_all()
 
+    print(
+        f"TEST PASSED: received {len(latencies)}/{args.frames} matching replies; "
+        f"latency min={min(latencies) * 1000:.1f}ms "
+        f"max={max(latencies) * 1000:.1f}ms"
+    )
     return 0
 
 
-def print_sent_message(index: int, total: int, message: SliceMessage) -> None:
-    print(
-        f"{index:02d}/{total:02d} "
-        f"sent /slice/set object={message.object_index} "
-        f"samples={message.radial_sample_count} "
-        f"normal=({message.normal[0]:.6f}, "
-        f"{message.normal[1]:.6f}, {message.normal[2]:.6f}) "
-        f"distance={message.distance:.6f}",
-        flush=True,
+def _rotation_normal(
+    frame_index: int,
+    frame_count: int,
+) -> tuple[float, float, float]:
+    """Rotate [0, 1, 0] once around X, as in the small SC scan examples."""
+    phase_divisor = max(frame_count - 1, 1)
+    angle = math.tau * frame_index / phase_divisor
+    return (0.0, math.cos(angle), math.sin(angle))
+
+
+def _wait_until(deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining > 0.0:
+        time.sleep(remaining)
+
+
+def _validate_reply(reply: SliceReply, object_id: int, sample_count: int) -> None:
+    if reply.object_id != object_id:
+        raise ValueError(
+            f"message {reply.message_id} returned object {reply.object_id}, "
+            f"expected {object_id}"
+        )
+    if len(reply.radii) != sample_count:
+        raise ValueError(
+            f"message {reply.message_id} returned {len(reply.radii)} radii, "
+            f"expected {sample_count}"
+        )
+    if not all(math.isfinite(radius) and radius >= 0.0 for radius in reply.radii):
+        raise ValueError(
+            f"message {reply.message_id} returned a negative or non-finite radius"
+        )
+
+
+def _print_reply(
+    frame_index: int,
+    frame_count: int,
+    reply: SliceReply,
+    normal: tuple[float, float, float],
+    latency: float,
+    print_radii: bool,
+) -> None:
+    prefix = (
+        f"{frame_index + 1:02d}/{frame_count:02d} "
+        f"id={reply.message_id} normal=({normal[0]:+.3f}, "
+        f"{normal[1]:+.3f}, {normal[2]:+.3f}) "
+        f"radii={len(reply.radii)} latency={latency * 1000:.1f}ms"
     )
-
-
-def make_print_slice_radii(print_full_radii: bool):
-    def print_slice_radii(*args: Any) -> None:
-        if len(args) < 2:
-            print(f"Unexpected /slice/radii payload: {args}", file=sys.stderr)
-            return
-
-        object_index = _as_int(args[0])
-        radii_count = len(args) - 1
-        if not print_full_radii:
-            print(f"received /slice/radii object={object_index} count={radii_count}", flush=True)
-            return
-
-        radii = [_as_float(value) for value in args[1:]]
-        formatted_radii = "\t".join(f"{radius:.6f}" for radius in radii)
+    if print_radii:
+        values = " ".join(f"{radius:.6f}" for radius in reply.radii)
+        print(f"{prefix}\n  {values}", flush=True)
+    else:
         print(
-            f"received /slice/radii object={object_index} count={len(radii)}\t"
-            f"{formatted_radii}",
+            f"{prefix} min={min(reply.radii):.6f} max={max(reply.radii):.6f}",
             flush=True,
         )
 
-    return print_slice_radii
-
-
-def print_osc_error(*args: Any) -> None:
-    message = " ".join(_as_text(arg) for arg in args)
-    print(f"received /osc/error {message}", file=sys.stderr, flush=True)
-
 
 def _as_int(value: Any) -> int:
-    if isinstance(value, bytes):
-        value = value.decode("utf-8")
-    return int(value)
+    return int(value.decode("utf-8") if isinstance(value, bytes) else value)
 
 
 def _as_float(value: Any) -> float:
-    if isinstance(value, bytes):
-        value = value.decode("utf-8")
-    return float(value)
-
-
-def _as_text(value: Any) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
-
-
-def load_slice_messages(path: Path) -> list[SliceMessage]:
-    with path.open("r", encoding="utf-8", newline="") as tsv_file:
-        rows = csv.reader(tsv_file, delimiter="\t")
-        return [message for message in _parse_rows(rows, path)]
-
-
-def _parse_rows(
-    rows: Iterable[list[str]],
-    path: Path,
-) -> Iterable[SliceMessage]:
-    for line_number, row in enumerate(rows, start=1):
-        if not row or _is_ignored_row(row):
-            continue
-
-        if _is_header_row(row):
-            continue
-
-        if len(row) != 6:
-            raise ValueError(
-                f"{path}:{line_number}: expected 6 tab-separated values, got {len(row)}"
-            )
-
-        try:
-            radial_sample_count = int(row[1])
-            if radial_sample_count <= 0:
-                raise ValueError("radial_sample_count must be positive")
-
-            yield SliceMessage(
-                object_index=int(row[0]),
-                radial_sample_count=radial_sample_count,
-                normal=(float(row[2]), float(row[3]), float(row[4])),
-                distance=float(row[5]),
-            )
-        except ValueError as exc:
-            raise ValueError(f"{path}:{line_number}: invalid numeric value") from exc
-
-
-def _is_ignored_row(row: list[str]) -> bool:
-    return len(row) == 1 and (not row[0].strip() or row[0].lstrip().startswith("#"))
-
-
-def _is_header_row(row: list[str]) -> bool:
-    return [value.strip().lower() for value in row] == [
-        "object_index",
-        "radial_sample_count",
-        "normal_x",
-        "normal_y",
-        "normal_z",
-        "distance",
-    ]
+    return float(value.decode("utf-8") if isinstance(value, bytes) else value)
 
 
 if __name__ == "__main__":
