@@ -168,7 +168,11 @@ def _set_slot_slice(*args: object) -> None:
 def _set_slot_visibility(*args: object) -> None:
     """Apply one /slice/show message."""
     slot_id = _as_int(args[0])
-    _slots[slot_id].visible = bool(_as_int(args[1]))
+    new_visible = bool(_as_int(args[1]))
+    state = _slots[slot_id]
+    if state.visible == new_visible and state.object_id is not None:
+        return  # Already in the requested state; skip to avoid flickering.
+    state.visible = new_visible
     _place_slot(slot_id)
 
 def _request_preload(*args: object) -> None:
