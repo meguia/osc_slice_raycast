@@ -131,6 +131,31 @@ class ReplyInbox:
 
         return replies
 
+    def drain(
+        self,
+        expected: dict[int, int],
+        sample_count: int,
+    ) -> list[SliceReply]:
+        replies: list[SliceReply] = []
+        while True:
+            try:
+                item = self._items.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, ValueError):
+                raise item
+            expected_object = expected.get(item.message_id)
+            if expected_object is None:
+                print(
+                    f"Ignoring unrelated /slice/radii id={item.message_id}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            validate_reply(item, expected_object, sample_count)
+            replies.append(item)
+        return replies
+
 
 def add_runtime_arguments(
     parser: argparse.ArgumentParser,
@@ -236,9 +261,10 @@ def run_demo(
     total_frames = math.ceil((duration * scheduler_rate) - TIMING_EPSILON)
     total_server_ticks = math.ceil((duration * args.server_rate) - TIMING_EPSILON)
     total_visual_ticks = math.ceil((duration * args.visual_rate) - TIMING_EPSILON)
-    message_id = 0
     reply_count = 0
     latencies: list[float] = []
+    expected_replies = {track.slot_id: track.object_id for track in tracks}
+    sent_at: dict[int, float] = {}
     visible_slots: set[int] = set()
     previous_step = -1
     previous_server_tick = -1
@@ -275,9 +301,6 @@ def run_demo(
                 visual_tick != previous_visual_tick
                 and visual_tick < total_visual_ticks
             )
-            expected: dict[int, int] = {}
-            sent_at: dict[int, float] = {}
-
             if send_to_visualizer:
                 for track in active_tracks:
                     send_visual_slice(visualizer, track, elapsed)
@@ -298,12 +321,11 @@ def run_demo(
             if send_to_server:
                 for track in active_tracks:
                     normal, distance = track.modulation.plane_at(elapsed)
-                    message_id += 1
-                    expected[message_id] = track.object_id
-                    sent_at[message_id] = time.monotonic()
+                    request_id = track.slot_id
+                    sent_at[request_id] = time.monotonic()
                     slicer.send_message(
                         b"/slice/get",
-                        [message_id, track.object_id, args.samples, *normal, distance],
+                        [request_id, track.object_id, args.samples, *normal, distance],
                     )
                 previous_server_tick = server_tick
 
@@ -315,16 +337,13 @@ def run_demo(
                 )
                 previous_step = absolute_step
 
-            if expected:
-                replies = inbox.wait_for(
-                    expected,
-                    args.samples,
-                    args.reply_timeout,
-                )
+            replies = inbox.drain(expected_replies, args.samples)
+            if replies:
                 reply_count += len(replies)
                 latencies.extend(
                     reply.received_at - sent_at[reply.message_id]
                     for reply in replies
+                    if reply.message_id in sent_at
                 )
 
             next_frame_at = max(
@@ -338,13 +357,30 @@ def run_demo(
         print(f"TEST FAILED: {exc}", file=sys.stderr)
         return_code = 1
     else:
-        minimum = min(latencies) * 1000.0 if latencies else 0.0
-        maximum = max(latencies) * 1000.0 if latencies else 0.0
-        print(
-            f"TEST PASSED: {reply_count} matching replies; "
-            f"latency min={minimum:.1f}ms max={maximum:.1f}ms"
-        )
-        return_code = 0
+        deadline = time.monotonic() + args.reply_timeout
+        while reply_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+            replies = inbox.drain(expected_replies, args.samples)
+            reply_count += len(replies)
+            latencies.extend(
+                reply.received_at - sent_at[reply.message_id]
+                for reply in replies
+                if reply.message_id in sent_at
+            )
+        if reply_count == 0:
+            print(
+                "TEST FAILED: no /slice/radii replies received",
+                file=sys.stderr,
+            )
+            return_code = 1
+        else:
+            minimum = min(latencies) * 1000.0 if latencies else 0.0
+            maximum = max(latencies) * 1000.0 if latencies else 0.0
+            print(
+                f"TEST PASSED: {reply_count} matching replies; "
+                f"latency min={minimum:.1f}ms max={maximum:.1f}ms"
+            )
+            return_code = 0
     finally:
         for track in tracks:
             try:

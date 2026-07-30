@@ -30,11 +30,11 @@ OSC_RECEIVE_HOST = "0.0.0.0"
 OSC_RECEIVE_PORT = 9005
 UPDATE_INTERVAL_SECONDS = 1.0 / 120.0  # Blender timer interval.
 
-GRID_COLUMNS = 5
+GRID_COLUMNS = 4
 GRID_ROWS = 4
 SLOT_COUNT = GRID_COLUMNS * GRID_ROWS  # Fixed visual slots.
 SLOT_SPACING_X = 3.0
-SLOT_SPACING_Y = 3.0
+SLOT_SPACING_Z = 3.0
 PARK_LOCATION = (100.0, 0.0, 0.0)  # Off-camera parking point.
 
 VISUAL_SAMPLE_COUNT = 128  # Loop resolution.
@@ -42,10 +42,8 @@ RAY_EPSILON = 1.0e-7  # Avoid origin self-hits.
 PLANE_SIZE = 2.6
 LOOP_BEVEL_DEPTH = 0.008
 CAMERA_TARGET_NAME = "DynamicSliceCameraTarget"  # Camera target object.
-CAMERA_LENS_RANGE = (28.0, 70.0)  # Lens clamp.
 CAMERA_FRAME_SCALE = 1.8
 CAMERA_SLOT_PADDING = 2.8
-CAMERA_MIN_DISTANCE = 5.0
 CAMERA_POSITION_TIME = 0.9
 CAMERA_ZOOM_TIME = 1.2
 
@@ -64,12 +62,22 @@ _slots = {slot_id: SlotState() for slot_id in range(SLOT_COUNT)}  # Slot state.
 _preload_queue: "deque[int]" = deque()  # BVHs to build.
 _camera_initialized = False  # Snap camera once.
 
+def _set_rendered_viewport() -> None:
+    """Open Layout with rendered 3D viewport shading."""
+    workspace = bpy.data.workspaces["Layout"]
+    for window in bpy.context.window_manager.windows:
+        window.workspace = workspace
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                area.spaces.active.shading.type = "RENDERED"
+
 def start_slice_visualizer() -> None:
     """Start the visualizer service."""
     global _server, _timer_running, _source_proxies
     if _server is not None:
         print("Slice visualizer is already running")
         return
+    _set_rendered_viewport()
     _source_proxies = _source_proxies_by_id()
     server = OSCThreadServer()
     server.listen(address=OSC_RECEIVE_HOST, port=OSC_RECEIVE_PORT, default=True)
@@ -190,11 +198,11 @@ def _slot_position(slot_id: int) -> Vector:
     row = slot_id // GRID_COLUMNS
     column = slot_id % GRID_COLUMNS
     x = (column - ((GRID_COLUMNS - 1) * 0.5)) * SLOT_SPACING_X
-    y = (((GRID_ROWS - 1) * 0.5) - row) * SLOT_SPACING_Y
-    return Vector((x, y, 0.0))
+    z = (((GRID_ROWS - 1) * 0.5) - row) * SLOT_SPACING_Z
+    return Vector((x, 0.0, z))
 
 def _update_camera() -> None:
-    """Animate the camera target and lens."""
+    """Animate the camera target and framing."""
     global _camera_initialized
     visible_slots = [
         slot_id
@@ -206,17 +214,7 @@ def _update_camera() -> None:
     camera = bpy.context.scene.camera
     target = bpy.data.objects[CAMERA_TARGET_NAME]
     positions = [_slot_position(slot_id) for slot_id in visible_slots]
-    min_x = min(position.x for position in positions)
-    max_x = max(position.x for position in positions)
-    min_y = min(position.y for position in positions)
-    max_y = max(position.y for position in positions)
-    target_location = Vector((((min_x + max_x) * 0.5), ((min_y + max_y) * 0.5), 0.0))
-    width = (max_x - min_x) + CAMERA_SLOT_PADDING
-    height = (max_y - min_y) + CAMERA_SLOT_PADDING
-    radius = max(
-        math.sqrt((width * 0.5) ** 2 + (height * 0.5) ** 2) * CAMERA_FRAME_SCALE,
-        0.001,
-    )
+    target_location = sum(positions, Vector((0.0, 0.0, 0.0))) / len(positions)
     position_alpha = 1.0 - math.exp(-UPDATE_INTERVAL_SECONDS / CAMERA_POSITION_TIME)
     zoom_alpha = 1.0 - math.exp(-UPDATE_INTERVAL_SECONDS / CAMERA_ZOOM_TIME)
     if _camera_initialized:
@@ -224,14 +222,12 @@ def _update_camera() -> None:
     else:
         target.location = target_location
         _camera_initialized = True
-    render = bpy.context.scene.render
-    aspect = (render.resolution_x * render.pixel_aspect_x) / (
-        render.resolution_y * render.pixel_aspect_y
-    )
-    sensor = min(camera.data.sensor_width, camera.data.sensor_width / aspect)
-    distance = max((camera.location - target.location).length, CAMERA_MIN_DISTANCE)
-    lens = sensor * distance / (2.0 * radius)
-    lens = min(max(lens, CAMERA_LENS_RANGE[0]), CAMERA_LENS_RANGE[1])
+    min_x = min(position.x for position in positions)
+    max_x = max(position.x for position in positions)
+    half_width = max(target.location.x - min_x, max_x - target.location.x)
+    radius = max((half_width + (CAMERA_SLOT_PADDING * 0.5)) * CAMERA_FRAME_SCALE, 0.001)
+    distance = (camera.location - target.location).length
+    lens = camera.data.sensor_width * distance / (2.0 * radius)
     camera.data.lens += (lens - camera.data.lens) * zoom_alpha
     target.update_tag()
     camera.update_tag()
